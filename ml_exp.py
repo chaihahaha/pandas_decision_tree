@@ -1,15 +1,31 @@
+# coding=utf-8
 import pandas as pd
 from math import log2
+import random
+
 positive_value = 'recurrence-events'
 negative_value = 'no-recurrence-events'
+unknown_value = '?'
 
 
 class Node:
     def __init__(self):
         self.decision_attribute = ''    # 决策属性
-        # self.attribute_values = []      # 决策属性值
         self.test_branch = {}           # 分支测试 {决策属性值：子树} 字典
         self.leaf_label = '非叶结点'    # 叶结点标签
+
+
+def print_tree(root, key_value_string, target_attribute):
+    if root.leaf_label != '非叶结点':
+        if root.leaf_label:
+            print(key_value_string + '\b\b\b\b' + ' → ' + '[' + target_attribute + ' = ' + positive_value + ']')
+        else:
+            print(key_value_string + '\b\b\b\b' + ' → ' + '[' + target_attribute + ' = ' + negative_value + ']')
+    if root.leaf_label == '非叶结点':
+        for v in root.test_branch.keys():
+            tmp = key_value_string + '[' + root.decision_attribute + ' = ' + str(v) + '] ' + ' ∧ '
+            print_tree(root.test_branch[v], tmp, target_attribute)
+    return
 
 
 def entropy(s, target_attribute):
@@ -66,24 +82,25 @@ def id3_build_tree(examples, target_attribute, attributes):
             new_node.leaf_label = examples[target_attribute].mode()[0] == positive_value
         else:
             new_node = id3_build_tree(examples_vi, target_attribute, [i for i in attributes if i != a])
-        root.test_branch.update({vi: new_node})
+        if vi != unknown_value:
+            root.test_branch.update({vi: new_node})
     return root
 
 
-def id3_prune(examples, target_attribute, root):
+def id3_prune(examples, target_attribute, root, tree):
     # 对决策树进行剪枝
     if root.leaf_label != '非叶结点':
         return root
-    old_correctness = id3_correctness(root, examples, target_attribute)
+    for v in root.test_branch.keys():
+        root.test_branch[v] = id3_prune(examples, target_attribute, root.test_branch[v], tree)
+    old_correctness = id3_correctness(tree, examples, target_attribute)
     root.leaf_label = examples[target_attribute].mode()[0] == positive_value
-    new_correctness = id3_correctness(root, examples, target_attribute)
+    new_correctness = id3_correctness(tree, examples, target_attribute)
     if new_correctness > old_correctness:
         return root
     else:
         root.leaf_label = '非叶结点'
-        for child in root.test_branch.values():
-            id3_prune(examples, target_attribute, child)
-    return root
+        return root
 
 
 def id3_classify(root, example):
@@ -91,6 +108,8 @@ def id3_classify(root, example):
     while root.leaf_label == '非叶结点':
         if example[root.decision_attribute] in root.test_branch:
             root = root.test_branch[example[root.decision_attribute]]
+        elif example[root.decision_attribute] == unknown_value:
+            root = root.test_branch[random.choice(list(root.test_branch))]
         else:
             return '拒分'
     if root.leaf_label:
@@ -126,15 +145,33 @@ def divide_train_test(cancer, fraction, fraction_train):
     return train1, train2, test
 
 
+def save_tree(tree, filename):
+    import pickle
+    fw = open(filename, 'wb')
+    pickle.dump(tree, fw)
+    fw.close()
+
+
+def load_tree(filename):
+    import pickle
+    fr = open(filename, 'rb')
+    tree = pickle.load(fr)
+    fr.close()
+    return tree
+
+
 target_attribute = 'Class'                                                            # 设置目标属性值
 attributes = ['Class', 'age', 'menopause', 'tumor-size', 'inv-nodes', 'node-caps',
           'deg-malig', 'breast', 'breast-quad', 'irradiat']                           # 设置属性值
 breast_cancer = pd.read_csv('breast-cancer.data', names=attributes).sample(frac=1)    # sample方法打乱数据集
 breast_cancer = breast_cancer.reset_index(drop=True)
-breast_cancer_train1, breast_cancer_train2, breast_cancer_test = divide_train_test(breast_cancer, 0.8, 0.9)
+breast_cancer_train1, breast_cancer_train2, breast_cancer_test = divide_train_test(breast_cancer, 1, 0.6)
 
 attributes.remove(target_attribute)                                                   # 获得非目标属性值
 
 id3_tree = id3_build_tree(breast_cancer_train1, target_attribute, attributes)         # 建立决策树
-id3_tree = id3_prune(breast_cancer_train2, target_attribute, id3_tree)                # 剪枝
-print('分类准确度', id3_correctness(id3_tree, breast_cancer_test, target_attribute))  # 计算准确度   最高：0.810344827
+id3_tree = id3_prune(breast_cancer_train2, target_attribute, id3_tree, id3_tree)      # 剪枝
+print_tree(id3_tree, '', target_attribute)                                            # 打印决策树
+save_tree(id3_tree, 'id3_tree.tree')                                                  # 将决策树保存为二进制文件
+print('train1: ', len(breast_cancer_train1), 'train2: ', len(breast_cancer_train2), 'test: ', len(breast_cancer_test))
+print('分类准确度', id3_correctness(id3_tree, breast_cancer_train2, target_attribute))   # 计算准确度   最高：0.8275862068965517
