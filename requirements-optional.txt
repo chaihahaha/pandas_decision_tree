@@ -1,0 +1,3 @@
+-r requirements.txt
+# Only needed for `python ml_exp.py --benchmark` and `python wisconsin_demo.py`
+scikit-learn>=1.3
