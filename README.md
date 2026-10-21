@@ -65,6 +65,12 @@ python ml_exp.py --benchmark
 # 在更容易的 Wisconsin 数据集上演示 >90%（需要 scikit-learn）
 python wisconsin_demo.py
 
+# NumPy vs pandas 热路径微基准
+python benchmarks/pandas_vs_numpy.py --reps 300
+
+# pandas 决策树：groupby 版 vs 编码版 vs 整数内核
+python benchmarks/pandas_tree_bench.py --reps 100
+
 # 单元测试
 python -m unittest discover -s tests -v
 ```
@@ -114,18 +120,163 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 3. 项目结构
+## 3. 为什么热路径用 NumPy，而不是全程 pandas？
+
+pandas 的 `DataFrame` / `Series` **不是比 NumPy 更底层的存储**，它是对 NumPy 的封装：
+底层仍是 ndarray，但额外维护 index、BlockManager、dtype 元数据和列名。调用 pandas 的
+向量化方法最终仍会进入 NumPy，同时增加索引对齐、临时 Series/Index 对象和复制的开销。
+因此，“从 NumPy 换成 pandas 以减少访存”在原理上是不成立的；**pandas 不会减少内存访问，
+它增加了一层抽象**。
+
+本仓库的实测微基准（`python benchmarks/pandas_vs_numpy.py --reps 300`，
+286 行 × 21 特征，同一台机器）：
+
+| 实现 | 每次分裂搜索耗时 | 相对 NumPy | 单次峰值分配 |
+|---|---:|---:|---:|
+| NumPy 数组 | **0.209 ms** | 1.00× | 31.5 KiB |
+| pandas 原生（Series.argsort/iloc/cumsum） | 6.178 ms | **29.6×** | 76.3 KiB |
+| pandas 仅作容器 + NumPy 内核 | 0.473 ms | 2.27× | 39.1 KiB |
+
+ID3 单属性信息增益：
+
+| 实现 | 耗时 | 加速比 |
+|---|---:|---:|
+| pandas 逐取值布尔过滤（原项目风格） | 1.332 ms | 1× |
+| NumPy 列联表 + bincount | **0.048 ms** | **27.7×** |
+
+静态内存：
+
+| 表示 | 占用 |
+|---|---:|
+| 原始 pandas DataFrame（object/字符串列） | 156,066 B |
+| 编码后的 uint8 类别码 | **2,574 B** |
+| 编码后的 float32 数值矩阵 | **24,024 B** |
+| float64 数值矩阵 | 48,048 B |
+
+结论：
+
+1. **真正的访存/内存优化来自表示和算法**：字符串 → uint8 类别码、float64 → float32、
+   用列联表/前缀和代替反复布尔过滤和 DataFrame 复制，而不是“换成 pandas”。
+2. **GBDT 的热循环**是“排序一个特征 → 前缀和 → 计算分裂增益”，天然映射到连续 NumPy 数组。
+   用 pandas 原生 Series 操作会慢约 **30×**，峰值分配约 **2.4×**。
+3. 如果只用 DataFrame 作容器、在热循环前 `.to_numpy()`，仍然比纯 NumPy 慢约 **2.3×**
+   （列提取/转换开销），但比 pandas 原生操作快得多。
+4. 原项目“全程 pandas”的决策树慢，**主要不是 pandas 的访存布局问题**，而是
+   `s[s[attr] == v]` 在每个属性、每个取值上重复扫描并复制 DataFrame；
+   即使保留 pandas，用 `groupby`/`value_counts` 一次算出列联表也能大幅加速。
+   但在 GBDT 的排序+前缀和内核里，NumPy 是更合适的层。
+5. LightGBM / XGBoost 也接受 pandas 输入，但训练前会转换成自己的连续数组/CSR 结构，
+   不会在 DataFrame 上做逐节点分裂搜索——原因相同。
+
+因此本项目的设计是：**pandas 负责 I/O、缺失值、类别编码、切分和报告；
+NumPy 负责树/GBDT 的数值内核**。这不是“不用 pandas”，而是把合适的工具放在合适的层。
+
+---
+
+## 3.1 pandas 决策树的两条优化路径
+
+pandas 的优点确实可以保留，而且不必在“通用性”和“性能”之间二选一：
+
+| 路径 | 类 | 特点 | 适用场景 |
+|---|---|---|---|
+| pandas API + 紧凑整数内核 | `PandasID3Classifier` | 直接接收含字符串/缺失值的 DataFrame；pandas 负责编码、索引、规则输出；热循环用整数码 | **推荐**，生产/实验默认 |
+| 纯 pandas `groupby` | `GroupbyID3Classifier` | 每个节点每个特征一次 `groupby`，无手工编码；字符串直接处理 | 教学、必须保持 pandas 风格的场景 |
+| 整数矩阵 | `ID3Classifier` | 最快，但输入必须是整数类别码 | 已有编码管线、追求极限速度 |
+
+### 用法
+
+```python
+from pandas_dt import PandasID3Classifier, GroupbyID3Classifier
+
+# 推荐：字符串 DataFrame 直接进，pd.Series / pd.DataFrame 直接出
+tree = PandasID3Classifier(target="Class", min_samples_leaf=2).fit(
+    train_df, eval_set=val_df
+)
+pred = tree.predict(test_df)              # pd.Series，保留原索引
+proba = tree.predict_proba(test_df)       # pd.DataFrame，列是类别标签
+tree.export_rules("results/pandas_rules.txt")
+
+# 纯 pandas 参考实现（同样的 DataFrame API）
+pure = GroupbyID3Classifier(target="Class").fit(train_df, eval_set=val_df)
+```
+
+### 具体做了哪些 pandas 优化
+
+1. **一次编码，而不是每个节点重新比较字符串**：
+   `pd.Categorical` / `pd.factorize` 把字符串转成整数码，类别表只保留一次。
+   API 仍然是字符串，规则输出仍然显示原始标签。
+2. **用一次 `groupby` 代替逐取值过滤**：
+   原实现 `for v in s[attr].unique(): s[s[attr] == v]` 会为每个取值复制一个 DataFrame；
+   现在 `df.groupby([attr, target]).size().unstack()` 一次得到列联表。
+3. **`observed=True` + `Categorical`**：
+   避免 `groupby` 为未出现的类别生成笛卡尔积空行，也减少字符串比较。
+4. **`value_counts()` 代替 `mode()`**：
+   叶节点预测和类别概率一次得到，不再对每个节点调用 `mode()[0]`。
+5. **自底向上剪枝**：
+   只把到达该节点的验证索引/子 DataFrame 传下去，局部比较叶节点和子树的准确率；
+   不再在每个节点重新预测整棵树。
+6. **批量预测**：
+   `predict` 返回 `pd.Series`，保留原索引；不再 `for i in range(n): df.loc[i, :]`。
+7. **保留 pandas 的“边界能力”**：
+   列名、字符串、缺失值、`Categorical`、索引、规则/概率输出都由 pandas 处理；
+   只有热循环里的排序/前缀和/列联表使用紧凑数组。
+
+### 实测（286 行，`python benchmarks/pandas_tree_bench.py`）
+
+分裂增益内核（9 个属性，一次调用）：
+
+| 实现 | 耗时 | 相对原版 | 峰值分配 |
+|---|---:|---:|---:|
+| 原版逐取值过滤 | 4.87 ms | 1.00× | 41.0 KiB |
+| pandas `groupby` | **2.24 ms** | **2.17×** | 30.5 KiB |
+| 整数 `bincount` | **0.195 ms** | **25.0×** | 4.8 KiB |
+
+完整建树 + 验证集剪枝：
+
+| 实现 | fit 耗时 | 节点数 | holdout 准确率 |
+|---|---:|---:|---:|
+| 原版（实测 build 0.075 s + prune 0.072 s） | ~147 ms | — | ~0.65 |
+| `GroupbyID3Classifier`（纯 pandas） | **74.4 ms** | 15 | 0.6667 |
+| `PandasID3Classifier`（pandas API + 整数内核） | **5.4 ms** | 25 | 0.6842 |
+| `ID3Classifier`（纯整数矩阵） | 3.5 ms | 25 | 0.6842 |
+
+> 原版数字是同一台机器、同一划分下用仓库历史版本实测的；原版包含随机缺失值路径，
+> 所以准确率不是严格同口径。这里重点看耗时量级。
+
+扩展到合成数据（9 个类别特征，`max_depth=5`，`min_samples_leaf=5`）：
+
+| 行数 | `PandasID3Classifier` | `GroupbyID3Classifier` | 倍数 |
+|---:|---:|---:|---:|
+| 1,000 | 6.2 ms | 341.1 ms | 55× |
+| 5,000 | 29.7 ms | 1,856.7 ms | 62× |
+| 20,000 | 46.4 ms | 6,826.8 ms | 147× |
+
+结论：
+
+- **纯 pandas 也能提速**：`groupby` 版约 2× 于原版，且随数据量增长优势更明显；
+- **但 pandas 的最佳用法是“边界用 pandas，内核用紧凑编码”**：
+  `PandasID3Classifier` 比纯 pandas 快约 14×（286 行）、在 20k 行快约 147×；
+- pandas 的通用性（字符串、缺失值、索引、列名、规则）在 `PandasID3Classifier` 中**完全保留**，
+  并没有因为用整数内核而丢失。
+
+---
+
+## 4. 项目结构
 
 ```
 pandas_dt/
 ├── data.py          # 数据加载、缺失值、类别编码、分层切分、K 折
-├── tree.py          # 修复后的 ID3/C4.5（多路类别分裂 + REP 剪枝）
+├── tree.py          # 修复后的 ID3/C4.5（整数编码 + REP 剪枝）
+├── pandas_tree.py   # pandas API 树：PandasID3Classifier / GroupbyID3Classifier
 ├── gbdt.py          # CART 回归树 + 二阶 GBDT（logistic loss）
 ├── metrics.py       # accuracy / logloss / AUC / bootstrap CI / 阈值调优
 └── utils.py         # 模型序列化、JSON 报告
 ml_exp.py            # 主实验入口（ID3 + GBDT + 嵌套 CV + 目标检查）
 wisconsin_demo.py    # 可选：同一个 GBDT 在 Wisconsin 数据集上的 >90% 演示
-tests/               # 32 个单元测试
+benchmarks/
+├── pandas_vs_numpy.py   # pandas vs NumPy 热路径/内存微基准
+└── pandas_tree_bench.py # pandas 决策树：增益/建树/扩展性基准
+tests/               # 48 个单元测试
 ```
 
 ### ID3 / C4.5
@@ -157,7 +308,7 @@ leaf value = -G/(H+λ)
 
 ---
 
-## 4. 本数据集上的结果（可复现）
+## 5. 本数据集上的结果（可复现）
 
 命令：`python ml_exp.py --benchmark`
 
@@ -215,7 +366,7 @@ python wisconsin_demo.py
 
 ---
 
-## 5. 评估协议
+## 6. 评估协议
 
 - **Holdout**：`stratified_split(y, test_size=0.2, val_size=0.2, seed=42)`，互斥、分层。
 - **阈值**：只在验证集上选择，再应用到测试集；`accuracy@0.5` 是主指标。
@@ -230,11 +381,11 @@ python wisconsin_demo.py
 
 ---
 
-## 6. 复现性与测试
+## 7. 复现性与测试
 
 ```bash
 python -m unittest discover -s tests -v
-# Ran 32 tests ... OK
+# Ran 48 tests ... OK
 ```
 
 测试覆盖：
@@ -247,7 +398,7 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 7. 参考文献与数据来源
+## 8. 参考文献与数据来源
 
 - UCI Machine Learning Repository: Breast Cancer dataset
   <https://archive.ics.uci.edu/dataset/14/breast+cancer>
@@ -258,7 +409,7 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 8. 附注：旧的 `rules0.7913043478260869.txt`
+## 9. 附注：旧的 `rules0.7913043478260869.txt`
 
 该文件来自原实现，准确率是在 `train2`（剪枝集）上计算的；原实现的 train1/train2/test 存在重叠，
 且 `test` 为空。因此这个 0.79 **不是测试准确率**，不能与本文的 holdout/CV 数字直接比较。

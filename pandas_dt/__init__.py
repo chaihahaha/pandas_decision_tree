@@ -19,6 +19,7 @@ from .data import (
     stratified_split,
 )
 from .tree import ID3Classifier, ID3Node
+from .pandas_tree import GroupbyID3Classifier, PandasID3Classifier
 from .gbdt import GBDTClassifier, RegressionTree
 from .metrics import (
     accuracy_score,
@@ -43,6 +44,8 @@ __all__ = [
     "stratified_kfold",
     "stratified_split",
     "ID3Classifier",
+    "PandasID3Classifier",
+    "GroupbyID3Classifier",
     "ID3Node",
     "GBDTClassifier",
     "RegressionTree",
